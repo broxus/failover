@@ -1,0 +1,24 @@
+[package]
+name = "failover"
+version = "0.1.0"
+edition = "2021"
+
+[[example]]
+name = "node"
+path = "examples/node.rs"
+
+[dependencies]
+anyhow = { version = "1.0" }
+dashmap = "5.4"
+etcd-client = { version = "0.10.0", features = ["tls"] }
+futures = "0.3"
+hex = "0.4"
+rand = "0.8"
+tokio = { version = "1", features = ["macros", "time"] }
+tokio-util = "0.7"
+tonic = "0.8.0"
+tracing = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "time", "rt-multi-thread"] }
+tracing-subscriber = "0.3"
