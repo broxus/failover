@@ -36,6 +36,8 @@ async fn spawn_leader(peer_name: String) {
         if client.commit(-1, 1337, i).await.unwrap() {
             println!("{} {}", peer_name, i);
             tokio::time::sleep(Duration::from_millis(500)).await;
+        }else {
+            println!("not leader {i} {peer_name}");
         }
     }
     tracing::info!("{} is done", peer_name);

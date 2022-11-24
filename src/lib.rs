@@ -315,6 +315,7 @@ impl NodeState {
             shard_id,
             self.peer_name.clone(),
             cancel_token,
+            self.prefix.clone(),
         )
         .await?;
 
@@ -358,6 +359,7 @@ struct ShardClient {
     lease_id: LeaseId,
     shard_id: ShardId,
     name: String,
+    prefix: String
 }
 
 impl ShardClient {
@@ -367,6 +369,7 @@ impl ShardClient {
         shard_id: ShardId,
         name: String,
         cancel_token: CancellationToken,
+        prefix: String
     ) -> Result<Arc<Self>> {
         let client = Arc::new(Self {
             is_leader: Default::default(), // init later
@@ -374,6 +377,7 @@ impl ShardClient {
             lease_id,
             shard_id,
             name,
+            prefix,
         });
 
         let is_leader = client.try_elect().await.context("Failed to elect")?;
@@ -453,7 +457,7 @@ impl ShardClient {
     }
 
     async fn try_elect(&self) -> Result<bool> {
-        let campaign = self.shard_id.to_string();
+        let campaign = format!("{}/{}", self.prefix, self.shard_id);
 
         let leader_self = self.lease_id.make_leader_value(&self.name);
         let value = leader_self.to_string().into_bytes();
