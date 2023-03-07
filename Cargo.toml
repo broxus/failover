@@ -20,5 +20,6 @@ tonic = "0.8.0"
 tracing = "0.1"
 
 [dev-dependencies]
-tokio = { version = "1", features = ["macros", "time", "rt-multi-thread"] }
-tracing-subscriber = "0.3"
+tokio = { version = "1", features = ["full"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+signal-hook = "0.3.15"

@@ -1,38 +1,38 @@
 #![warn(
-    clippy::all,
-    clippy::dbg_macro,
-    clippy::todo,
-    clippy::empty_enum,
-    clippy::enum_glob_use,
-    clippy::mem_forget,
-    clippy::unused_self,
-    clippy::filter_map_next,
-    clippy::needless_continue,
-    clippy::needless_borrow,
-    clippy::match_wildcard_for_single_variants,
-    clippy::if_let_mutex,
-    clippy::mismatched_target_os,
-    clippy::await_holding_lock,
-    clippy::match_on_vec_items,
-    clippy::imprecise_flops,
-    clippy::suboptimal_flops,
-    clippy::lossy_float_literal,
-    clippy::rest_pat_in_fully_bound_structs,
-    clippy::fn_params_excessive_bools,
-    clippy::exit,
-    clippy::inefficient_to_string,
-    clippy::linkedlist,
-    clippy::macro_use_imports,
-    clippy::option_option,
-    clippy::verbose_file_reads,
-    clippy::unnested_or_patterns,
-    clippy::str_to_string,
-    rust_2018_idioms,
-    future_incompatible,
-    nonstandard_style,
-    missing_debug_implementations,
-    clippy::unused_async,
-    clippy::await_holding_lock
+clippy::all,
+clippy::dbg_macro,
+clippy::todo,
+clippy::empty_enum,
+clippy::enum_glob_use,
+clippy::mem_forget,
+clippy::unused_self,
+clippy::filter_map_next,
+clippy::needless_continue,
+clippy::needless_borrow,
+clippy::match_wildcard_for_single_variants,
+clippy::if_let_mutex,
+clippy::mismatched_target_os,
+clippy::await_holding_lock,
+clippy::match_on_vec_items,
+clippy::imprecise_flops,
+clippy::suboptimal_flops,
+clippy::lossy_float_literal,
+clippy::rest_pat_in_fully_bound_structs,
+clippy::fn_params_excessive_bools,
+clippy::exit,
+clippy::inefficient_to_string,
+clippy::linkedlist,
+clippy::macro_use_imports,
+clippy::option_option,
+clippy::verbose_file_reads,
+clippy::unnested_or_patterns,
+clippy::str_to_string,
+rust_2018_idioms,
+future_incompatible,
+nonstandard_style,
+missing_debug_implementations,
+clippy::unused_async,
+clippy::await_holding_lock
 )]
 #![deny(unreachable_pub, private_in_public)]
 #![allow(elided_lifetimes_in_paths, clippy::type_complexity)]
@@ -40,7 +40,7 @@
 use std::fmt::{Debug, Display, Formatter};
 use std::hash::Hash;
 use std::str::FromStr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -90,7 +90,7 @@ impl Node {
             .grant(config.lease_time.as_secs() as i64, None)
             .await
             .context("initial lease failed")?;
-        let lease_id = LeaseId(grant.id());
+        let lease_id = LeaseId::new(grant.id());
 
         tracing::info!(
             %lease_id,
@@ -142,14 +142,29 @@ struct NodeState {
 
 impl NodeState {
     /// A background process which proves that you are alive
-    async fn start_heartbeat_process(&self, lease_time: Duration) -> Result<()> {
+    async fn start_heartbeat_process(self: &Arc<Self>, lease_time: Duration) -> Result<()> {
+        async fn check_lease_is_alive(client: &mut LeaseClient, lease_id: LeaseId) -> Result<bool> {
+            loop {
+                match client.time_to_live(lease_id.as_i64(), None).await {
+                    Ok(a) => {
+                        tracing::debug!(%lease_id, ttl = %a.ttl(), "lease status");
+                        break Ok(a.ttl() > 0);
+                    }
+                    Err(e) => {
+                        tracing::error!("failed to check lease: {:?}",e);
+                        continue;
+                    }
+                };
+            }
+        }
+
         async fn lease_round(client: &mut LeaseClient, lease_time: Duration, lease_id: LeaseId) {
             let retry_interval = Duration::from_secs(1);
 
             let half_lease_time = lease_time / 2;
 
             // getting lease with previously assigned id
-            let grant_options = LeaseGrantOptions::new().with_id(*lease_id);
+            let grant_options = LeaseGrantOptions::new().with_id(lease_id.as_i64());
             match client
                 .grant(lease_time.as_secs() as i64, Some(grant_options))
                 .await
@@ -158,11 +173,11 @@ impl NodeState {
                     tracing::debug!(%lease_id, "renewed lease");
                 }
                 Err(Error::GRpcStatus(s))
-                    if s.code() == tonic::Code::FailedPrecondition
-                        && s.message().contains("lease already exists") =>
-                {
-                    tracing::debug!(%lease_id, "lease already exists");
-                }
+                if s.code() == tonic::Code::FailedPrecondition
+                    && s.message().contains("lease already exists") =>
+                    {
+                        tracing::debug!(%lease_id, "lease already exists");
+                    }
                 Err(e) => {
                     if !matches!(e, Error::GRpcStatus(_)) {
                         tracing::error!("lease grant error: {e:?}");
@@ -175,7 +190,7 @@ impl NodeState {
 
             // -----------------------------------------------------
             // keep alive stream
-            let (mut keeper, mut stream) = match client.keep_alive(*lease_id).await {
+            let (mut keeper, mut stream) = match client.keep_alive(lease_id.as_i64()).await {
                 Ok(a) => a,
                 Err(e) => {
                     tracing::error!("failed to get lease keep alive stream: {e:?}");
@@ -194,9 +209,30 @@ impl NodeState {
             // end of keep alive stream
             // -----------------------------------------------------
 
-            // main keep alive loop
+            // checking if lease is active, getting new one if not
             loop {
                 let now = std::time::Instant::now();
+
+                match check_lease_is_alive(client, lease_id.clone()).await {
+                    Ok(true) => {
+                        tracing::debug!("lease is alive");
+                    }
+                    Ok(false) => {
+                        tracing::debug!("lease is not alive, renewing");
+                        return;
+                    }
+                    Err(e) => {
+                        tracing::error!("failed to check lease: {e:?}");
+                        if now.elapsed() > lease_time {
+                            tracing::warn!("lease expired");
+                            return;
+                        }
+                        time::sleep(Duration::from_secs(1)).await;
+                        continue;
+                    }
+                }
+                // main keep alive loop
+
                 // trying to prolong lease
 
                 while let Err(e) = keeper.keep_alive().await {
@@ -218,16 +254,18 @@ impl NodeState {
             }
         }
 
-        let mut lease_client = self.etcd_client.lease_client();
-        let cancellation_token = self.cancellation_token.clone();
-        let lease_id = self.lease_id;
-
+        let this = self.clone();
         // trying  to keep lease alive
         tokio::spawn(async move {
+            let mut lease_client = this.etcd_client.lease_client();
+            let lease_id = this.lease_id.clone();
+            let cancellation_token = this.cancellation_token.clone();
+
             tokio::pin!(let cancelled = cancellation_token.cancelled(););
             loop {
+                this.update_lease(&mut lease_client, lease_time).await;
                 tokio::select! {
-                    _ = lease_round(&mut lease_client, lease_time, lease_id) => {
+                    _ = lease_round(&mut lease_client, lease_time, lease_id.clone()) => {
                         tracing::warn!("restarted lease round");
                     }
                     _ = &mut cancelled => {
@@ -239,6 +277,25 @@ impl NodeState {
         });
 
         Ok(())
+    }
+
+
+    async fn update_lease(&self, client: &mut LeaseClient,
+                          lease_time: Duration, ) {
+        loop {
+            match client
+                .grant(lease_time.as_secs() as i64, None)
+                .await {
+                Ok(l) => {
+                    break self.lease_id.set(l.id());
+                }
+                Err(e) => {
+                    tracing::error!( "failed to update lease: {:?}",e);
+                    time::sleep(Duration::from_secs(1)).await;
+                    continue;
+                }
+            };
+        }
     }
 
     /// Commits new seqno for the specified shard
@@ -254,7 +311,7 @@ impl NodeState {
                     .put(key.to_string(), seq_no.to_string(), None)
                     .await
                 {
-                    tracing::error!(%shard_id, %key, value = seq_no, "failed to commit a value: {e:?}");
+                    tracing::error!(?shard_id, %key, value = seq_no, "failed to commit a value: {e:?}");
                     time::sleep(Duration::from_secs(1)).await;
                 }
 
@@ -306,18 +363,18 @@ impl NodeState {
             return Ok(elector.value().clone());
         }
 
-        tracing::info!(%shard_id, "creating new elector");
+        tracing::info!(?shard_id, "creating new elector");
 
         let cancel_token = self.cancellation_token.child_token();
         let elector = ShardClient::new(
             self.etcd_client.clone(),
-            self.lease_id,
+            self.lease_id.clone(),
             shard_id,
             self.peer_name.clone(),
             cancel_token,
             self.prefix.clone(),
         )
-        .await?;
+            .await?;
 
         self.electors.insert(shard_id, elector.clone());
         Ok(elector)
@@ -359,7 +416,7 @@ struct ShardClient {
     lease_id: LeaseId,
     shard_id: ShardId,
     name: String,
-    prefix: String
+    prefix: String,
 }
 
 impl ShardClient {
@@ -369,7 +426,7 @@ impl ShardClient {
         shard_id: ShardId,
         name: String,
         cancel_token: CancellationToken,
-        prefix: String
+        prefix: String,
     ) -> Result<Arc<Self>> {
         let client = Arc::new(Self {
             is_leader: Default::default(), // init later
@@ -406,13 +463,15 @@ impl ShardClient {
     }
 
     async fn status_observer(&self) -> Result<()> {
-        let campaign = self.shard_id.to_string();
+        let campaign = self.shard_id.prefixed(&self.prefix).to_string();
+        tracing::debug!(?campaign, "starting status observer");
         let mut observer = self.client.clone().observe(campaign).await?;
 
         let leader_self = self.lease_id.make_leader_value(&self.name);
         let value = leader_self.to_string().into_bytes();
 
         while let Some(event) = observer.next().await {
+            tracing::debug!(shard_id = ?self.shard_id, "got election status event");
             let mut status = match event {
                 Ok(status) => status,
                 Err(e) => {
@@ -422,7 +481,7 @@ impl ShardClient {
             };
 
             let (mut is_leader, leader_lease_id) = match status.take_kv() {
-                Some(kv) => (kv.value() == value, Some(LeaseId(kv.lease()))),
+                Some(kv) => (kv.value() == value, Some(LeaseId::new(kv.lease()))),
                 None => {
                     tracing::info!("leader is dead, trying to elect");
                     (false, None)
@@ -431,7 +490,7 @@ impl ShardClient {
 
             if !is_leader {
                 if let Some(leader_lease_id) = leader_lease_id {
-                    if let Err(e) = self.wait_for_leader_death(leader_lease_id).await {
+                    if let Err(e) = self.wait_for_leader_death(leader_lease_id.clone()).await {
                         tracing::error!(%leader_lease_id, "failed to wait for leader death: {e:?}");
                     }
                 }
@@ -457,7 +516,7 @@ impl ShardClient {
     }
 
     async fn try_elect(&self) -> Result<bool> {
-        let campaign = format!("{}/{}", self.prefix, self.shard_id);
+        let campaign = self.shard_id.prefixed(&self.prefix).to_string();
 
         let leader_self = self.lease_id.make_leader_value(&self.name);
         let value = leader_self.to_string().into_bytes();
@@ -468,14 +527,14 @@ impl ShardClient {
         Ok(loop {
             tracing::info!(
                 lease_id = %self.lease_id,
-                campaign = %self.shard_id,
+                campaign = ?self.shard_id,
                 %leader_self,
                 "trying to become a leader"
             );
 
             let rand_wait_time = rand::thread_rng().gen_range(waiting_time_range.clone());
             let campaign_fut =
-                election_client.campaign(campaign.clone(), value.clone(), *self.lease_id);
+                election_client.campaign(campaign.clone(), value.clone(), self.lease_id.as_i64());
 
             let Ok(campaign_res) = time::timeout(rand_wait_time, campaign_fut).await else {
                 tracing::info!("there is another leader, giving up election");
@@ -493,7 +552,7 @@ impl ShardClient {
             match campaign_res {
                 Ok(mut response) => {
                     tracing::debug!(?response, "got campaign response");
-                    break matches!(response.take_leader(), Some(leader) if leader.lease() == *self.lease_id);
+                    break matches!(response.take_leader(), Some(leader) if leader.lease() == self.lease_id.as_i64());
                 }
                 // etcd fucked up and returned an error.
                 Err(e) => {
@@ -506,9 +565,13 @@ impl ShardClient {
     }
 
     async fn wait_for_leader_death(&self, leader_lease_id: LeaseId) -> Result<()> {
+        tracing::debug!(%leader_lease_id, "waiting for leader death");
         let mut lease_client = self.client.lease_client();
         loop {
-            match lease_client.time_to_live(*leader_lease_id, None).await {
+            match lease_client
+                .time_to_live(leader_lease_id.as_i64(), None)
+                .await
+            {
                 Ok(res) if res.ttl() < 0 => {
                     return Ok(());
                 }
@@ -547,7 +610,7 @@ impl ShardId {
     }
 }
 
-impl Display for ShardId {
+impl Debug for ShardId {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         f.write_fmt(format_args!("{}:{:016x}", self.wc, self.shard))
     }
@@ -561,45 +624,51 @@ struct PrefixedShardId<'a> {
 
 impl Display for PrefixedShardId<'_> {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        f.write_fmt(format_args!("{}/{}", self.prefix, self.shard_id))
+        f.write_fmt(format_args!("{}/{:?}", self.prefix, self.shard_id))
     }
 }
 
-#[derive(Clone, Copy)]
-struct LeaderValue<'a> {
+#[derive(Clone)]
+struct LeaderValue<'a, 'b> {
     name: &'a str,
-    lease_id: LeaseId,
+    lease_id: &'b LeaseId,
 }
 
-impl Display for LeaderValue<'_> {
+impl Display for LeaderValue<'_, '_> {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         f.write_fmt(format_args!("{}/{}", self.name, self.lease_id))
     }
 }
 
-#[derive(Clone, Copy)]
-struct LeaseId(i64);
+#[derive(Clone)]
+struct LeaseId(Arc<AtomicI64>);
 
 impl LeaseId {
-    fn make_leader_value(self, name: &str) -> LeaderValue<'_> {
+    fn new(id: i64) -> Self {
+        Self(Arc::new(AtomicI64::new(id)))
+    }
+
+    fn make_leader_value<'a, 'name>(&'a self, name: &'name str) -> LeaderValue<'name, 'a> {
         LeaderValue {
             name,
             lease_id: self,
         }
     }
-}
 
-impl std::ops::Deref for LeaseId {
-    type Target = i64;
+    fn as_i64(&self) -> i64 {
+        self.0.load(Ordering::Acquire)
+    }
 
-    fn deref(&self) -> &Self::Target {
-        &self.0
+    fn set(&self, value: i64) {
+        let new_lease = LeaseId::new(value);
+        tracing::debug!(previous_lease= %self, %new_lease, "lease updated");
+        self.0.store(value, Ordering::Release);
     }
 }
 
 impl Display for LeaseId {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        f.write_fmt(format_args!("{:#4x}", self.0))
+        f.write_fmt(format_args!("{:#4x}", self.as_i64()))
     }
 }
 
