@@ -2,6 +2,8 @@
 name = "failover"
 version = "0.1.1"
 edition = "2021"
+description = 'failover based on etcd'
+license-file = "LICENSE"
 
 [[example]]
 name = "node"
