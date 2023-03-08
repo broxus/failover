@@ -287,6 +287,7 @@ impl NodeState {
                 .grant(lease_time.as_secs() as i64, None)
                 .await {
                 Ok(l) => {
+                    self.electors.clear();
                     break self.lease_id.set(l.id());
                 }
                 Err(e) => {
